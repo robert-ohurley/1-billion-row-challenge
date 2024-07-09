@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -43,6 +42,12 @@ type Tally struct {
 	results map[string]*StationResult
 }
 
+func (t *Tally) Print() {
+	for k, v := range t.results {
+		fmt.Println("result", string(string(k)), float32(v.min)/10, float32(v.max)/10, float32(v.sum)/10/float32(v.count))
+	}
+}
+
 var FinalTally Tally = Tally{
 	make(map[string]*StationResult),
 }
@@ -70,7 +75,7 @@ func main() {
 	go func() {
 		log.Println(http.ListenAndServe("localhost:6060", nil))
 	}()
-	filePtr, err := os.Open("./measurements.txt")
+	filePtr, err := os.Open("./test_measurements.txt")
 
 	if err != nil {
 		log.Fatal("Error reading file")
@@ -83,6 +88,8 @@ func main() {
 	linesCh := readInFile(filePtr)
 	out := parseCh(linesCh)
 	<-out
+
+	//FinalTally.Print()
 
 	//Timing
 	elapsed := time.Since(start)
@@ -118,7 +125,6 @@ func parseCh(in <-chan []byte) <-chan int {
 
 func parseLines(chunk []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	scanner := bufio.NewScanner(bytes.NewReader(chunk))
 
 	for scanner.Scan() {
@@ -142,7 +148,8 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 
 		//Optimisation: parse backwards over the float and do integer arithmetic to avoid floating point arithmetic
 		//Stored values are multiplied by 10 to remove the one guaranteed decimal point
-		exponent := 0
+		power10 := 1
+
 		for i := len(b) - 1; i > semiColonIdx; i-- {
 			if b[i] == byte('.') {
 				continue
@@ -153,10 +160,11 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 				break
 			}
 
-			stationTemp += int(b[i]-48) * (int(math.Pow10(exponent)))
-			exponent++
+			stationTemp += int(b[i]-48) * power10
+			power10 *= 10
 		}
 
+		//TODO: fix race condition
 		result, ok := FinalTally.results[string(station)]
 
 		if !ok {
@@ -164,7 +172,6 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 				0, 0, 0, 0, &sync.Mutex{},
 			}
 		}
-
 		result.m.Lock()
 
 		if stationTemp > result.max {
@@ -179,8 +186,6 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 
 		result.sum += stationTemp
 		result.m.Unlock()
-
-		//fmt.Println("result", string(station), float32(result.min)/10, float32(result.max)/10, float32(result.sum)/10/float32(result.count))
 	}
 
 	//Return buffer to pool
