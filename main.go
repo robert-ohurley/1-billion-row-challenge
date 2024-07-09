@@ -1,8 +1,9 @@
 /*
-The task is to write a Java program which reads the file, calculates the min, mean, and max temperature value per weather station,
+The task is to write a program which reads the file, calculates the min, mean, and max temperature value per weather station,
 and emits the results on stdout like this (i.e. sorted alphabetically by station name, and the result values per station in the format <min>/<mean>/<max>,
 rounded to one fractional digit):
 */
+
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -21,24 +23,17 @@ import (
 	"time"
 )
 
-var GlobalLock = &sync.Mutex{}
-var BuffersAllocated = 0
-var Returned = 0
-
-// Optimisation: Reusing buffers after having been scanned reduces memory allocation from
-// approx 60,000 buffers of 512 x 512kb to approx 600.
-// Reduces memory allocation from ~15gb to ~125mb
+// Optimisation: Reusing buffers after having been parsed reduces memory allocation from
+// approx 30,000 buffers of 1024 x 512kb to approx 10,000
+// Reduced memory allocation from ~15gb to ~5gb
 var BufferPool = &sync.Pool{
 	New: func() interface{} {
-		GlobalLock.Lock()
-		BuffersAllocated++
-		GlobalLock.Unlock()
 		return make([]byte, 0, BUFFER_SIZE)
 	},
 }
 
 const (
-	BUFFER_SIZE = 512 * 512
+	BUFFER_SIZE = 1024 * 512
 )
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
@@ -87,12 +82,11 @@ func main() {
 	//Use channels to synchronise
 	linesCh := readInFile(filePtr)
 	out := parseCh(linesCh)
-
 	<-out
+
+	//Timing
 	elapsed := time.Since(start)
 	fmt.Println(elapsed)
-	fmt.Println("Alloc: ", BuffersAllocated)
-	fmt.Println("Returned: ", Returned)
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
@@ -133,7 +127,7 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 		semiColonIdx := -1
 
 		for i, b := range b {
-			if b == ';' {
+			if b == byte(';') {
 				semiColonIdx = i
 			}
 		}
@@ -147,22 +141,24 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 		stationTemp := 0
 
 		//Optimisation: parse backwards over the float and do integer arithmetic to avoid floating point arithmetic
+		//Stored values are multiplied by 10 to remove the one guaranteed decimal point
+		exponent := 0
 		for i := len(b) - 1; i > semiColonIdx; i-- {
-			exponent := 0
-
-			if b[i] == '.' {
+			if b[i] == byte('.') {
 				continue
 			}
 
-			if b[i] == '-' {
+			if b[i] == byte('-') {
 				stationTemp *= -1
+				break
 			}
 
-			stationTemp += int(b[i]) * (10 ^ int(exponent))
+			stationTemp += int(b[i]-48) * (int(math.Pow10(exponent)))
 			exponent++
 		}
 
 		result, ok := FinalTally.results[string(station)]
+
 		if !ok {
 			result = &StationResult{
 				0, 0, 0, 0, &sync.Mutex{},
@@ -170,6 +166,7 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 		}
 
 		result.m.Lock()
+
 		if stationTemp > result.max {
 			result.max = stationTemp
 		}
@@ -181,11 +178,12 @@ func parseLines(chunk []byte, wg *sync.WaitGroup) {
 		result.count++
 
 		result.sum += stationTemp
-
 		result.m.Unlock()
+
+		//fmt.Println("result", string(station), float32(result.min)/10, float32(result.max)/10, float32(result.sum)/10/float32(result.count))
 	}
 
-	//Return chunked buffer to pool
+	//Return buffer to pool
 	BufferPool.Put(chunk)
 }
 
@@ -193,7 +191,7 @@ func readInFile(filePtr *os.File) <-chan []byte {
 	//Optimisation: Read into a single buffer, clone the results into a channel
 	//Works best with approx 512kb x 512kb buffer size
 	buffer := make([]byte, BUFFER_SIZE)
-	fragment := make([]byte, 1024)
+	fragment := make([]byte, 0)
 
 	//fragLength is the value returned by copy otherwise I would just do len(fragment)
 	fragLength := 0
@@ -201,10 +199,8 @@ func readInFile(filePtr *os.File) <-chan []byte {
 
 	go func() {
 		for {
-			//clone := make([]byte, BUFFER_SIZE)
 			//Buffer only gets returned to the pool when a scanner has read all it's bytes
-			//Length is reset to zero
-			clone := BufferPool.Get().([]byte)[0:0]
+			clone := BufferPool.Get().([]byte)
 
 			//If any bytes are in the fragment, prepend to clone and resume copying after.
 			if len(fragment) > 0 {
@@ -219,8 +215,9 @@ func readInFile(filePtr *os.File) <-chan []byte {
 				break
 			}
 
+			//Here the number of bytes in the buffer is fragLength + bytes copied.
 			//Optimisation: Read backwards over the partial line and copy it into the fragment buffer for use next time through.
-			if buffer[n-1] != byte('\n') {
+			if buffer[(fragLength+n)-1] != byte('\n') {
 				for i := n - 1; i >= 0; i-- {
 					if buffer[i] == byte('\n') {
 						copy(fragment, buffer[i:])
@@ -230,7 +227,9 @@ func readInFile(filePtr *os.File) <-chan []byte {
 				}
 			}
 
-			//Copy the buffer content into a new buffer up until the beginning of the fragment
+			//Reslice the pool buffer to be the length of bytes read + fragment length
+			//Copy the buffer content into a new buffer up until the beginning of the fragmented line which is now stored for next iteration
+			clone = clone[0:n]
 			copy(clone, buffer[:n])
 
 			out <- clone
